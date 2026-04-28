@@ -2,7 +2,7 @@
 // @id              explorer-force-details-columns
 // @name            Explorer Details View Columns
 // @description     Forces a fixed set of columns in File Explorer Details view. Columns and their order are configurable. Has no effect on other view modes.
-// @version         1.1
+// @version         1.2
 // @author          ernisn
 // @github          https://github.com/ernisn
 // @include         explorer.exe
@@ -34,6 +34,7 @@ For a full list of available Shell property names, see: https://learn.microsoft.
 
 **Note:**
 - Any property name not recognised by Windows will be skipped.
+- Duplicate property entries will only take the first occurrence.
 - To allow a column to be freely resized, turn off "Force Width".
 - Changes should take effect immediately to opened folders, but if the opened window is on **another monitor with a differnt DPI settings**, the width will be updated **after re-opening the folder once**.
 */
@@ -61,6 +62,9 @@ For a full list of available Shell property names, see: https://learn.microsoft.
     - width: 60
   $name: Columns
   $description: "Columns to show in order in Details view. Width is in logical pixels at 100% DPI scaling."
+- verbose_logging: false
+  $name: Verbose Logging
+  $description: Enable detailed logs for debugging. Logs are written to Windhawk's log output. Leave off for normal use.
 */
 // ==/WindhawkModSettings==
 
@@ -74,6 +78,7 @@ For a full list of available Shell property names, see: https://learn.microsoft.
 #include <servprov.h>
 #include <vector>
 #include <cmath>
+#include <cstdlib>
 #include <windhawk_utils.h>
 
 // IID_IServiceProvider from Windows SDK {6D5140C1-7436-11CE-8034-00AA006009FA}
@@ -91,47 +96,104 @@ struct ColumnEntry {
 };
 
 static std::vector<ColumnEntry> g_columns;
+static bool                     g_settingsLoaded = false; // true once a non-empty load succeeds
+static bool                     g_verboseLogging = false;
+
+// Width comparison tolerance (in physical pixels) to avoid width update loops
+static constexpr UINT kWidthTolerancePx = 1;
+
+#define WH_LOG_VERBOSE(...) do { if (g_verboseLogging) Wh_Log(__VA_ARGS__); } while (0)
+
+static bool PropertyKeysEqual(const PROPERTYKEY& a, const PROPERTYKEY& b) {
+    return a.fmtid == b.fmtid && a.pid == b.pid;
+}
 
 static void LoadSettings() {
-    g_columns.clear();
+    g_verboseLogging = Wh_GetIntSetting(L"verbose_logging") != 0;
+
+    std::vector<ColumnEntry> newColumns;
+    int duplicatesSkipped = 0;
+    int unrecognisedSkipped = 0;
+    bool sawAnyEntry = false;
 
     for (int i = 0; ; i++) {
         PCWSTR rawProp = Wh_GetStringSetting(L"columns[%d].property", i);
-        if (!rawProp || rawProp[0] == L'\0') {
+
+        // Distinguish "settings not ready / no more entries" from "empty string"
+        // Wh_GetStringSetting returns nullptr if the index is out of range, or an empty string if the field exists but is blank
+        if (!rawProp) {
+            break;
+        }
+        if (rawProp[0] == L'\0') {
             Wh_FreeStringSetting(rawProp);
             break;
         }
 
+        sawAnyEntry = true;
+
         PROPERTYKEY key;
         if (SUCCEEDED(PSGetPropertyKeyFromName(rawProp, &key))) {
-            BOOL forceWidth = Wh_GetIntSetting(L"columns[%d].force_width", i);
-            int width = Wh_GetIntSetting(L"columns[%d].width", i);
-            
-            if (!forceWidth) {
-                width = 0; 
+            // Skip if this key is already in newColumns
+            bool isDuplicate = false;
+            for (const auto& existing : newColumns) {
+                if (PropertyKeysEqual(existing.key, key)) {
+                    isDuplicate = true;
+                    break;
+                }
             }
 
-            g_columns.push_back({ key, width });
-            Wh_Log(L"Column[%d]: %s force=%d width=%d -> OK", i, rawProp, forceWidth, width);
+            if (isDuplicate) {
+                Wh_Log(L"Column[%d]: %s -> duplicate, skipped", i, rawProp);
+                duplicatesSkipped++;
+            } else {
+                BOOL forceWidth = Wh_GetIntSetting(L"columns[%d].force_width", i);
+                int width = Wh_GetIntSetting(L"columns[%d].width", i);
+
+                if (!forceWidth) {
+                    width = 0;
+                }
+
+                newColumns.push_back({ key, width });
+                WH_LOG_VERBOSE(L"Column[%d]: %s force=%d width=%d -> OK",
+                               i, rawProp, forceWidth, width);
+            }
         } else {
             Wh_Log(L"Column[%d]: %s -> not recognised, skipped", i, rawProp);
+            unrecognisedSkipped++;
         }
 
         Wh_FreeStringSetting(rawProp);
     }
 
-    if (g_columns.empty()) {
-        Wh_Log(L"No valid columns configured, using defaults");
-        g_columns.push_back({ PKEY_ItemNameDisplay, 270 });
-        g_columns.push_back({ PKEY_Size,             30 });
-        g_columns.push_back({ PKEY_DateModified,    110 });
-        g_columns.push_back({ PKEY_ItemTypeText,     60 });
+    // 1. At least one valid column
+    //   => commit the new list
+    // 2. At least one entry but none valid (unrecognised/duplicates) 
+    //   => commit empty; skip and not fall back to defaults
+    // 3. No entries
+    //   => not overwrite the in-memory list with defaults
+
+    if (!newColumns.empty()) {
+        g_columns = std::move(newColumns);
+        g_settingsLoaded = true;
+        Wh_Log(L"Loaded %zu columns (skipped %d duplicates, %d unrecognised)",
+               g_columns.size(), duplicatesSkipped, unrecognisedSkipped);
+    } else if (sawAnyEntry) {
+        // User config exists but every entry was invalid => Apply nothing
+        g_columns.clear();
+        g_settingsLoaded = true;
+        Wh_Log(L"All configured columns invalid (skipped %d duplicates, %d unrecognised); "
+               L"no columns will be enforced",
+               duplicatesSkipped, unrecognisedSkipped);
+    } else {
+        // No entries readable. Leave g_columns and g_settingsLoaded untouched. If this is the very first load, g_settingsLoaded stays false and apply paths will skip until SettingsChanged with real data
+        Wh_Log(L"No column entries readable (settings not ready yet, or empty list). "
+               L"Leaving previous configuration in place (loaded=%d, count=%zu)",
+               g_settingsLoaded ? 1 : 0, g_columns.size());
     }
 }
 
 // ---------------------------------------------------------------------------
 // DPI helpers
-// Try GetDpiForWindow
 // ---------------------------------------------------------------------------
 
 static UINT GetSystemDpi() {
@@ -153,7 +215,7 @@ static UINT GetWindowDpi(HWND hwnd) {
         GetProcAddress(GetModuleHandleW(L"user32.dll"), "GetDpiForWindow"));
     if (pGetDpiForWindow && hwnd)
         return pGetDpiForWindow(hwnd);
-        
+
     return GetSystemDpi();
 }
 
@@ -167,48 +229,77 @@ static UINT ScaleToDpi(int logicalPx, UINT dpi) {
 // ---------------------------------------------------------------------------
 
 static void ApplyForcedColumns(void* pThis) {
+    // Prevent applying default values when user settings haven't been successfully loaded
+    if (!g_settingsLoaded || g_columns.empty()) {
+        WH_LOG_VERBOSE(L"ApplyForcedColumns: skipping (loaded=%d, count=%zu)",
+                       g_settingsLoaded ? 1 : 0, g_columns.size());
+        return;
+    }
+
     auto* pShellView = reinterpret_cast<IShellView*>(pThis);
 
     HWND hwnd = nullptr;
-    pShellView->GetWindow(&hwnd);
+    HRESULT hrWnd = pShellView->GetWindow(&hwnd);
+    if (FAILED(hrWnd)) {
+        WH_LOG_VERBOSE(L"ApplyForcedColumns: GetWindow failed hr=0x%08X", hrWnd);
+        // GetWindowDpi fallbacks to system DPI
+    }
     UINT windowDpi = GetWindowDpi(hwnd);
 
     IFolderView2* pFV2 = nullptr;
-    if (FAILED(pShellView->QueryInterface(IID_IFolderView2,
-                                          reinterpret_cast<void**>(&pFV2))) || !pFV2)
+    HRESULT hrFV2 = pShellView->QueryInterface(IID_IFolderView2,
+                                               reinterpret_cast<void**>(&pFV2));
+    if (FAILED(hrFV2) || !pFV2) {
+        WH_LOG_VERBOSE(L"ApplyForcedColumns: QI(IFolderView2) failed hr=0x%08X", hrFV2);
         return;
+    }
 
     FOLDERVIEWMODE viewMode = FVM_AUTO;
     int iconSize = 0;
     HRESULT hr = pFV2->GetViewModeAndIconSize(&viewMode, &iconSize);
     pFV2->Release();
 
-    if (FAILED(hr) || viewMode != FVM_DETAILS)
+    if (FAILED(hr)) {
+        WH_LOG_VERBOSE(L"ApplyForcedColumns: GetViewModeAndIconSize failed hr=0x%08X", hr);
         return;
+    }
+    if (viewMode != FVM_DETAILS) {
+        WH_LOG_VERBOSE(L"ApplyForcedColumns: not details view (mode=%d), skipping",
+                       (int)viewMode);
+        return;
+    }
 
     IColumnManager* pCM = nullptr;
-    if (FAILED(pShellView->QueryInterface(IID_IColumnManager,
-                                          reinterpret_cast<void**>(&pCM))) || !pCM)
+    HRESULT hrCM = pShellView->QueryInterface(IID_IColumnManager,
+                                              reinterpret_cast<void**>(&pCM));
+    if (FAILED(hrCM) || !pCM) {
+        WH_LOG_VERBOSE(L"ApplyForcedColumns: QI(IColumnManager) failed hr=0x%08X", hrCM);
         return;
+    }
 
     // Check if the column settings need update
     UINT colCount = 0;
     bool orderNeedsUpdate = false;
-    
-    if (FAILED(pCM->GetColumnCount(CM_ENUM_VISIBLE, &colCount)) || colCount != g_columns.size()) {
+
+    HRESULT hrCount = pCM->GetColumnCount(CM_ENUM_VISIBLE, &colCount);
+    if (FAILED(hrCount) || colCount != g_columns.size()) {
         orderNeedsUpdate = true;
+        WH_LOG_VERBOSE(L"ApplyForcedColumns: column count mismatch (current=%u expected=%zu hr=0x%08X)",
+                       colCount, g_columns.size(), hrCount);
     } else {
         std::vector<PROPERTYKEY> currentKeys(colCount);
-        if (SUCCEEDED(pCM->GetColumns(CM_ENUM_VISIBLE, currentKeys.data(), colCount))) {
+        HRESULT hrGet = pCM->GetColumns(CM_ENUM_VISIBLE, currentKeys.data(), colCount);
+        if (SUCCEEDED(hrGet)) {
             for (size_t i = 0; i < colCount; i++) {
-                if (currentKeys[i].fmtid != g_columns[i].key.fmtid ||
-                    currentKeys[i].pid != g_columns[i].key.pid) {
+                if (!PropertyKeysEqual(currentKeys[i], g_columns[i].key)) {
                     orderNeedsUpdate = true;
+                    WH_LOG_VERBOSE(L"ApplyForcedColumns: column %zu order mismatch", i);
                     break;
                 }
             }
         } else {
             orderNeedsUpdate = true;
+            WH_LOG_VERBOSE(L"ApplyForcedColumns: GetColumns failed hr=0x%08X", hrGet);
         }
     }
 
@@ -218,22 +309,29 @@ static void ApplyForcedColumns(void* pThis) {
         for (const auto& col : g_columns) {
             keys.push_back(col.key);
         }
-        pCM->SetColumns(keys.data(), static_cast<UINT>(keys.size()));
+        HRESULT hrSet = pCM->SetColumns(keys.data(), static_cast<UINT>(keys.size()));
+        WH_LOG_VERBOSE(L"ApplyForcedColumns: SetColumns hr=0x%08X (count=%zu)",
+                       hrSet, keys.size());
     }
 
     // Column width enforcement for those using a width value
     for (const auto& col : g_columns) {
         if (col.width <= 0)
-            continue; 
+            continue;
 
         CM_COLUMNINFO ci = {};
         ci.cbSize = sizeof(ci);
         ci.dwMask = CM_MASK_WIDTH;
         if (SUCCEEDED(pCM->GetColumnInfo(col.key, &ci))) {
             UINT expectedWidth = ScaleToDpi(col.width, windowDpi);
-            if (ci.uWidth != expectedWidth) {
+            // Avoid re-applying on px differences caused by rounding
+            int diff = static_cast<int>(ci.uWidth) - static_cast<int>(expectedWidth);
+            if (std::abs(diff) > static_cast<int>(kWidthTolerancePx)) {
                 ci.uWidth = expectedWidth;
-                pCM->SetColumnInfo(col.key, &ci);
+                HRESULT hrSetCi = pCM->SetColumnInfo(col.key, &ci);
+                WH_LOG_VERBOSE(L"ApplyForcedColumns: width update %u -> %u (diff=%d, hr=0x%08X)",
+                               static_cast<UINT>(static_cast<int>(ci.uWidth) - diff),
+                               expectedWidth, diff, hrSetCi);
             }
         }
     }
@@ -246,15 +344,30 @@ static void ApplyForcedColumns(void* pThis) {
 // ---------------------------------------------------------------------------
 
 static void ApplyToAllOpenWindows() {
-    IShellWindows* psw = nullptr;
-    if (FAILED(CoCreateInstance(CLSID_ShellWindows, nullptr, CLSCTX_LOCAL_SERVER,
-                                IID_IShellWindows, reinterpret_cast<void**>(&psw))) || !psw)
+    if (!g_settingsLoaded || g_columns.empty()) {
+        Wh_Log(L"ApplyToAllOpenWindows: skipping (loaded=%d, count=%zu)",
+               g_settingsLoaded ? 1 : 0, g_columns.size());
         return;
+    }
+
+    IShellWindows* psw = nullptr;
+    HRESULT hrCo = CoCreateInstance(CLSID_ShellWindows, nullptr, CLSCTX_LOCAL_SERVER,
+                                    IID_IShellWindows, reinterpret_cast<void**>(&psw));
+    if (FAILED(hrCo) || !psw) {
+        Wh_Log(L"ApplyToAllOpenWindows: CoCreateInstance(ShellWindows) failed hr=0x%08X", hrCo);
+        return;
+    }
 
     long count = 0;
-    psw->get_Count(&count);
+    HRESULT hrCount = psw->get_Count(&count);
+    if (FAILED(hrCount)) {
+        Wh_Log(L"ApplyToAllOpenWindows: get_Count failed hr=0x%08X", hrCount);
+        psw->Release();
+        return;
+    }
 
     DWORD currentProcessId = GetCurrentProcessId();
+    int processed = 0;
 
     for (long i = 0; i < count; i++) {
         VARIANT vi;
@@ -268,10 +381,10 @@ static void ApplyToAllOpenWindows() {
         IWebBrowserApp* pWBA = nullptr;
         if (SUCCEEDED(pDisp->QueryInterface(IID_IWebBrowserApp,
                                             reinterpret_cast<void**>(&pWBA))) && pWBA) {
-            
+
             HWND wnd = nullptr;
             pWBA->get_HWND(reinterpret_cast<SHANDLE_PTR*>(&wnd));
-            
+
             DWORD windowProcessId = 0;
             if (wnd) {
                 GetWindowThreadProcessId(wnd, &windowProcessId);
@@ -290,6 +403,7 @@ static void ApplyToAllOpenWindows() {
                             // Refresh directly here
                             pSV->Refresh();
                             pSV->Release();
+                            processed++;
                         }
                         pSB->Release();
                     }
@@ -301,6 +415,8 @@ static void ApplyToAllOpenWindows() {
         pDisp->Release();
     }
     psw->Release();
+
+    Wh_Log(L"ApplyToAllOpenWindows: processed %d window(s) out of %ld total", processed, count);
 }
 
 // ---------------------------------------------------------------------------
@@ -326,7 +442,7 @@ HRESULT __thiscall CDefView_UIActivate_hook(void* pThis, UINT uState) {
 // ---------------------------------------------------------------------------
 
 BOOL Wh_ModInit() {
-    Wh_Log(L"Init");
+    Wh_Log(L"Init v1.2");
 
     LoadSettings();
 
@@ -360,7 +476,15 @@ BOOL Wh_ModInit() {
 }
 
 void Wh_ModAfterInit() {
-    Wh_Log(L"AfterInit - applying to existing windows");
+    Wh_Log(L"AfterInit (loaded=%d, count=%zu)",
+           g_settingsLoaded ? 1 : 0, g_columns.size());
+
+    // If settings weren't ready during ModInit after restart, try one more time
+    if (!g_settingsLoaded) {
+        Wh_Log(L"AfterInit: settings not loaded yet, retrying");
+        LoadSettings();
+    }
+
     ApplyToAllOpenWindows();
 }
 
